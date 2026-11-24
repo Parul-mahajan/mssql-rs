@@ -377,13 +377,9 @@ function Invoke-BenchmarkLeg {
     # baseline vs a batched candidate never crosses the 1.05 regression ratio, and
     # it is selected by driver name rather than capability, so it will not
     # self-heal once the baseline can run parameter arrays. See #534 for options.
-    $env:ODBC_BENCH_WRITE_MODE = if (
-        $Scenario -eq 'write' -and $Driver -eq $script:BaselineDriverName
-    ) {
-        'sequential'
-    } else {
-        'parameter_array'
-    }
+    # MEASUREMENT-ONLY (r17): the pinned baseline is current main, which runs
+    # parameter arrays, so both legs use the same write mode.
+    $env:ODBC_BENCH_WRITE_MODE = 'parameter_array'
     Write-Host ">>> Running $Scenario with $Driver (write mode: $($env:ODBC_BENCH_WRITE_MODE))..."
     # Windows Microsoft ODBC accepts the spaced spelling; the Rust driver and the
     # Linux runner use PacketSize.
@@ -517,10 +513,12 @@ $ConfirmQuorum = Get-PositiveIntEnv -Name 'ODBC_BENCH_CONFIRM_QUORUM' `
 if ($ConfirmQuorum -gt $ConfirmRuns) {
     throw 'ODBC_BENCH_CONFIRM_QUORUM must not exceed ODBC_BENCH_CONFIRM_RUNS'
 }
-$ImprovementMax = Get-PositiveIntEnv -Name 'ODBC_BENCH_IMPROVEMENT_VERIFY_MAX' -Default 3
-$RegressionRatio = Get-RatioEnv -Name 'ODBC_BENCH_REGRESSION_RATIO' -Default 1.05
+# MEASUREMENT-ONLY (r17): verify every apparent improvement, not just three.
+$ImprovementMax = Get-PositiveIntEnv -Name 'ODBC_BENCH_IMPROVEMENT_VERIFY_MAX' -Default 30
+# MEASUREMENT-ONLY (r17): 1.02 regression and 1.01 improvement thresholds.
+$RegressionRatio = Get-RatioEnv -Name 'ODBC_BENCH_REGRESSION_RATIO' -Default 1.02
 $ImprovementRatio = Get-RatioEnv -Name 'ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO' `
-    -Default $RegressionRatio
+    -Default 1.01
 # A confirmed candidate-vs-pinned-baseline regression fails the run by default;
 # set ODBC_BENCH_FAIL_ON_REGRESSION=0 to publish the report without gating.
 $GateEnabled = $env:ODBC_BENCH_FAIL_ON_REGRESSION -ne '0'
@@ -737,7 +735,7 @@ try {
         "packet_size=$($env:ODBC_BENCH_PACKET_SIZE)",
         "packet_size_verified_by_harness=true",
         "write_candidate_mode=parameter_array",
-        "write_baseline_mode=sequential",
+        "write_baseline_mode=parameter_array",
         "write_reference_mode=parameter_array",
         "pywrite_mode=parameter_array",
         "repetitions=$script:Repetitions",
@@ -870,6 +868,24 @@ try {
         }
         Write-Host ">>> Initial pass flagged $($entry.Kind): $($entry.Name) (ratio $($fields[2]))"
         $plan += $entry
+    }
+    # MEASUREMENT-ONLY (r17): the pre-registered target rows are confirmed even
+    # when the initial pass does not flag them. As improvements, a round counts
+    # as a hit when its ratio is <= 1 / ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO.
+    $forcedNames = if ($env:ODBC_BENCH_FORCE_CONFIRM) {
+        $env:ODBC_BENCH_FORCE_CONFIRM
+    } else {
+        'getdata/rowwise_200k_c15_fixed/inline_values;getdata/rowwise_200k_c16_mixed_lob/whole_result_rowwise'
+    }
+    foreach ($forcedName in ($forcedNames -split ';' | Where-Object { $_ })) {
+        if (-not ($plan | Where-Object { $_.Name -eq $forcedName })) {
+            $plan += [pscustomobject]@{
+                Kind = 'improvement'
+                Name = $forcedName
+                Scenario = Get-BenchmarkScenario -Name $forcedName -ScenarioFiles $scenarioFiles
+            }
+            Write-Host ">>> Forced confirmation: $forcedName"
+        }
     }
 
     $confirmationArguments = @()

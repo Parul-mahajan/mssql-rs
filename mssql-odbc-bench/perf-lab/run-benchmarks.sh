@@ -189,11 +189,13 @@ if [ "$CONFIRM_QUORUM" -gt "$CONFIRM_RUNS" ]; then
     exit 1
 fi
 IMPROVEMENT_MAX="$(
+    # MEASUREMENT-ONLY (r17): verify every apparent improvement, not just three.
     read_positive_int ODBC_BENCH_IMPROVEMENT_VERIFY_MAX \
-        "${ODBC_BENCH_IMPROVEMENT_VERIFY_MAX:-3}" 1
+        "${ODBC_BENCH_IMPROVEMENT_VERIFY_MAX:-30}" 1
 )"
-REGRESSION_RATIO="${ODBC_BENCH_REGRESSION_RATIO:-1.05}"
-IMPROVEMENT_RATIO="${ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO:-$REGRESSION_RATIO}"
+# MEASUREMENT-ONLY (r17): 1.02 regression and 1.01 improvement thresholds.
+REGRESSION_RATIO="${ODBC_BENCH_REGRESSION_RATIO:-1.02}"
+IMPROVEMENT_RATIO="${ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO:-1.01}"
 # A confirmed candidate-vs-pinned-baseline regression fails the run by default;
 # set ODBC_BENCH_FAIL_ON_REGRESSION=0 to publish the report without gating.
 FAIL_ON_REGRESSION="${ODBC_BENCH_FAIL_ON_REGRESSION:-1}"
@@ -440,7 +442,7 @@ fi
     echo "packet_size=$ODBC_BENCH_PACKET_SIZE"
     echo "packet_size_verified_by_harness=true"
     echo "write_candidate_mode=parameter_array"
-    echo "write_baseline_mode=sequential"
+    echo "write_baseline_mode=parameter_array"
     echo "write_reference_mode=parameter_array"
     echo "pywrite_mode=parameter_array"
     echo "repetitions=$REPETITIONS"
@@ -479,7 +481,9 @@ run_leg() {
     # it is selected by driver name rather than capability, so it will not
     # self-heal once the baseline can run parameter arrays. See #534 for options.
     if [ "$scenario" = "write" ] && [ "$driver" = "$BASELINE_DRIVER_NAME" ]; then
-        write_mode=sequential
+        # MEASUREMENT-ONLY (r17): the pinned baseline is current main, which
+        # runs parameter arrays, so both legs use the same write mode.
+        write_mode=parameter_array
     fi
     echo ">>> Running $scenario with $driver (write mode: $write_mode)..."
     # Linux keeps the PacketSize spelling for every driver, including Microsoft
@@ -582,6 +586,29 @@ while IFS=$'\t' read -r plan_kind plan_name plan_ratio; do
     done
     [ "$already_selected" -eq 0 ] && CONFIRM_SCENARIOS+=("$plan_scenario")
 done < "$PLAN_FILE"
+
+# MEASUREMENT-ONLY (r17): the pre-registered target rows are confirmed even when
+# the initial pass does not flag them. As improvements, a round counts as a hit
+# when its ratio is <= 1 / ODBC_BENCH_IMPROVEMENT_VERIFY_RATIO.
+FORCE_CONFIRM="${ODBC_BENCH_FORCE_CONFIRM:-getdata/rowwise_200k_c15_fixed/inline_values;getdata/rowwise_200k_c16_mixed_lob/whole_result_rowwise}"
+IFS=';' read -r -a FORCED_NAMES <<< "$FORCE_CONFIRM"
+for forced_name in ${FORCED_NAMES[@]+"${FORCED_NAMES[@]}"}; do
+    [ -n "$forced_name" ] || continue
+    already_planned=0
+    for planned in ${VERIFY_NAMES[@]+"${VERIFY_NAMES[@]}"}; do
+        [ "$planned" = "$forced_name" ] && already_planned=1
+    done
+    [ "$already_planned" -eq 1 ] && continue
+    VERIFY_KINDS+=("improvement")
+    VERIFY_NAMES+=("$forced_name")
+    echo ">>> Forced confirmation: $forced_name"
+    forced_scenario="$(scenario_for_benchmark "$forced_name")"
+    already_selected=0
+    for selected in ${CONFIRM_SCENARIOS[@]+"${CONFIRM_SCENARIOS[@]}"}; do
+        [ "$selected" = "$forced_scenario" ] && already_selected=1
+    done
+    [ "$already_selected" -eq 0 ] && CONFIRM_SCENARIOS+=("$forced_scenario")
+done
 
 CONFIRMATION_ARGS=()
 if [ "${#VERIFY_NAMES[@]}" -gt 0 ]; then
