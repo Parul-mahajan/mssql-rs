@@ -41,11 +41,21 @@ macro_rules! ffi_entry {
                 })
             }
         } else {
-            let result = ::std::panic::catch_unwind(|| {
+            let call = || {
                 $crate::init_tracing();
-                $entry;
+                // The event's expansion is kept out of line; it would otherwise
+                // be part of every untraced call's body.
+                if $crate::tracing_init::debug_event_may_emit() {
+                    $crate::tracing_init::emit_outlined(|| $entry);
+                }
                 $body
-            });
+            };
+            // Only a reference to `call` crosses `catch_unwind`, which moves its
+            // closure through memory; moving the argument captures themselves
+            // adds a copy, and on some backends a stall, to every call.
+            // `call` captures only shared references, as the closure passed
+            // directly did, so asserting unwind safety adds nothing.
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| call()));
             $crate::ffi_entry!(@finish $name, result)
         }
     }};

@@ -320,6 +320,23 @@ pub(crate) fn init_tracing() {
     });
 }
 
+/// Whether a `DEBUG` event could reach a tracing subscriber or a `log` logger.
+/// `tracing`'s `log` feature can forward an event to `log` even while a
+/// dispatcher is set (`log-always`, possibly enabled by another crate), so
+/// either level alone keeps the event. A `false` answer means the event macro
+/// would have done nothing.
+#[inline(always)]
+pub(crate) fn debug_event_may_emit() -> bool {
+    tracing::level_filters::LevelFilter::current() >= tracing::level_filters::LevelFilter::DEBUG
+        || log::max_level() >= log::LevelFilter::Debug
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn emit_outlined(event: impl FnOnce()) {
+    event();
+}
+
 pub(crate) fn starts_execution(api: &str) -> bool {
     matches!(
         api,
@@ -1114,6 +1131,111 @@ mod tests {
         assert!(fields[4].contains("operation_id=42"));
         assert!(!output.contains("sql_command"));
         assert!(!output.contains("SECRET_SQL_LITERAL"));
+    }
+
+    // The untraced branch gates its entry event before building it; a
+    // subscriber the process installed some other way must still see both events.
+    #[test]
+    fn untraced_calls_still_emit_entry_and_return_events() {
+        use crate::api::odbc_types::{SQL_HANDLE_ENV, SQL_SUCCESS};
+        use crate::api::{SQLAllocHandle, SQLFreeHandle};
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&output);
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || TestWriter(Arc::clone(&sink)))
+                .event_format(LogFormatter),
+        );
+        assert!(!mssql_tds::trace_context::enabled());
+        let mut env = std::ptr::null_mut();
+        tracing::subscriber::with_default(subscriber, || unsafe {
+            assert_eq!(
+                SQLAllocHandle(SQL_HANDLE_ENV, std::ptr::null_mut(), &mut env),
+                SQL_SUCCESS
+            );
+        });
+        assert_eq!(unsafe { SQLFreeHandle(SQL_HANDLE_ENV, env) }, SQL_SUCCESS);
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("SQLAllocHandle called"), "{output}");
+        assert!(output.contains("SQLAllocHandle returning"), "{output}");
+    }
+
+    struct CapturedLog;
+
+    static CAPTURED_LOG_RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    impl log::Log for CapturedLog {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            CAPTURED_LOG_RECORDS
+                .lock()
+                .unwrap()
+                .push(record.args().to_string());
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Installs a process-wide `log` logger at `Debug`; later calls reuse it.
+    fn capture_log_records() -> &'static Mutex<Vec<String>> {
+        static CAPTURED: CapturedLog = CapturedLog;
+        let _ = log::set_logger(&CAPTURED);
+        log::set_max_level(log::LevelFilter::Debug);
+        &CAPTURED_LOG_RECORDS
+    }
+
+    // `tracing`'s `log` feature forwards events to a `log` logger when no
+    // dispatcher was ever set; the gated entry event must keep doing so.
+    #[test]
+    fn untraced_entry_event_reaches_a_log_logger_without_a_dispatcher() {
+        use crate::api::odbc_types::{SQL_HANDLE_ENV, SQL_SUCCESS};
+        use crate::api::{SQLAllocHandle, SQLFreeHandle};
+
+        assert!(!tracing::dispatcher::has_been_set());
+        let records = capture_log_records();
+        let mut env = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { SQLAllocHandle(SQL_HANDLE_ENV, std::ptr::null_mut(), &mut env) },
+            SQL_SUCCESS
+        );
+        assert_eq!(unsafe { SQLFreeHandle(SQL_HANDLE_ENV, env) }, SQL_SUCCESS);
+
+        let records = records.lock().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.contains("SQLAllocHandle called")),
+            "{records:?}"
+        );
+    }
+
+    // With `tracing/log-always`, which feature unification can enable from
+    // another crate, an event reaches a `DEBUG` logger even while a dispatcher
+    // that filters it out is set. That feature cannot be enabled for one test,
+    // so this pins the gate's answer for the configuration instead.
+    #[test]
+    fn a_debug_log_level_keeps_entry_events_behind_a_quieter_dispatcher() {
+        use tracing_subscriber::Layer;
+
+        capture_log_records();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::sink)
+                .with_filter(tracing::level_filters::LevelFilter::INFO),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                tracing::level_filters::LevelFilter::current()
+                    < tracing::level_filters::LevelFilter::DEBUG
+            );
+            assert!(debug_event_may_emit());
+        });
     }
 
     fn capture_correlation(work: impl FnOnce()) -> String {

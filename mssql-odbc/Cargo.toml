@@ -21,6 +21,8 @@ workspace = true
 mssql-tds = { path = "../mssql-tds" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 tracing = { version = "0.1.43", features = ["log"] }
+# Read only to gate `tracing`'s `log` fallback before building an entry event.
+log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono = { version = "0.4", features = ["clock"] }
 async-trait = "0.1"
