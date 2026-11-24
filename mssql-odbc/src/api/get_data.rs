@@ -112,6 +112,7 @@ pub(crate) unsafe fn sql_get_data(
 /// is still measured in bytes. For a fixed-width target it must be writable for
 /// the full size of `target_type`, even when `buffer_length` is zero or smaller.
 /// `strlen_or_ind_ptr`, when non-null, must be writable for one `SqlLen`.
+#[inline(always)]
 unsafe fn sql_get_data_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,
@@ -1004,6 +1005,7 @@ fn try_deliver_complete_buffered_unicode_plp(
 /// keep the column resident and re-readable. A rejected typed PLP value,
 /// however, is drained: stream initialization already advanced the column,
 /// so clearing `active_plp` makes a terminal error eligible to release busy.
+#[inline]
 fn finish_get_data(
     stmt: &StmtHandle,
     statement_handle: SqlHandle,
@@ -1022,27 +1024,36 @@ fn finish_get_data(
     let ready = stmt_state.current_row_last_col == col_index
         && col_index == stmt_state.column_metadata.len()
         && stmt_state.active_plp.is_none();
+    if !ready {
+        drop(stmt_state);
+        return rc;
+    }
+    finish_get_data_row(stmt, statement_handle, stmt_state, rc)
+}
+
+/// The once-per-row tail of [`finish_get_data`], kept out of line so the
+/// per-column return does not pay its frame.
+#[inline(never)]
+fn finish_get_data_row(
+    stmt: &StmtHandle,
+    statement_handle: SqlHandle,
+    mut stmt_state: MutexGuard<'_, StmtState>,
+    rc: SqlReturn,
+) -> SqlReturn {
     // A buffered fetch deferred the set's completion; msodbcsql reads its DONE
     // once SQLGetData reaches the last column, unless an ERROR token follows
     // the row, which it leaves for the next fetch (measured on 18.6.2.1).
-    let deferred_array_update = if ready {
-        stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
-        if stmt_state
-            .deferred_array_update
-            .as_ref()
-            .is_some_and(|update| !update.has_failed_set())
-        {
-            stmt_state.deferred_array_update.take()
-        } else {
-            None
-        }
+    stmt_state.spare_get_data_row = stmt_state.buffered_get_data_row.take();
+    let deferred_array_update = if stmt_state
+        .deferred_array_update
+        .as_ref()
+        .is_some_and(|update| !update.has_failed_set())
+    {
+        stmt_state.deferred_array_update.take()
     } else {
         None
     };
     drop(stmt_state);
-    if !ready {
-        return rc;
-    }
     let rc = match deferred_array_update {
         None => rc,
         Some(update) => {

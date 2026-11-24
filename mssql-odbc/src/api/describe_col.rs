@@ -79,6 +79,7 @@ pub(crate) unsafe fn sql_describe_col_w(
 /// other output pointer, when non-null, must be writable for one value of its
 /// pointed-to type.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 unsafe fn sql_describe_col_w_impl(
     statement_handle: SqlHandle,
     column_number: SqlUSmallInt,

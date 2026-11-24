@@ -2164,10 +2164,19 @@ impl StatementOperation<'_> {
 }
 
 impl Drop for StatementOperation<'_> {
+    #[inline]
     fn drop(&mut self) {
         if !self.active || self.finish_uncontended() {
             return;
         }
+        self.finish_contended();
+    }
+}
+
+impl StatementOperation<'_> {
+    #[cold]
+    #[inline(never)]
+    fn finish_contended(&mut self) {
         match self.stmt.cancel.lock() {
             Ok(mut state) => {
                 // This call settled the signal; the latched token must not
